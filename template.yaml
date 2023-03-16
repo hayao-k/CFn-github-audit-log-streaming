@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create AWS resources required for GitHub Enterprise Cloud audit log streaming.
+
+Parameters:
+  RetainDays:
+    Description: Number of days to keep audit log.
+    Type: String
+    Default: 365
+  EnterpriseName:
+    Description: Your GitHub Enterprise Name.
+    Type: String
+    Default: EXAPMLECORP
+  AccessLogPrefix:
+    Description: Server access log-prefix of audit log bucket.
+    Type: String
+    Default: logs/
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - Label: 
+          default: GitHub Configuration
+        Parameters: 
+          - EnterpriseName
+      - Label: 
+          default: Audit Log Configuration
+        Parameters: 
+          - RetainDays
+          - AccessLogPrefix
+
+Resources:
+  # Customer Managed Key for audit log encryption
+  AuditLogEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: Customer Managed Key for audit log encryption
+      Enabled: true
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Allow administration of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action:
+          - kms:Create*
+          - kms:Describe*
+          - kms:Enable*
+          - kms:List*
+          - kms:Put*
+          - kms:Update*
+          - kms:Revoke*
+          - kms:Disable*
+          - kms:Get*
+          - kms:Delete*
+          - kms:ScheduleKeyDeletion
+          - kms:CancelKeyDeletion
+          Resource: '*'
+        - Sid: Allow local use of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          Resource: '*'
+
+  # Customer Managed Key ALias
+  GitHubEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: 
+      AliasName: !Sub alias/${AWS::StackName}-key
+      TargetKeyId: !Ref AuditLogEncryptionKey
+  
+  # S3 bucket for audit log
+  AuditLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt AuditLogEncryptionKey.Arn
+            BucketKeyEnabled: true    
+      LifecycleConfiguration:
+        Rules:
+          - Id: Retain
+            Status: Enabled
+            ExpirationInDays: !Ref RetainDays
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: !Ref AccessLogPrefix
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  # S3 bucket policy for audit log
+  AudtiLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditLogBucket
+      PolicyDocument:
+        Statement:
+        - Effect: Deny
+          Principal: '*'
+          Action: 's3:*'
+          Resource: 
+            - !Sub ${AuditLogBucket.Arn}/*
+            - !GetAtt AuditLogBucket.Arn
+          Condition:
+            Bool: 
+              aws:SecureTransport: false
+  
+  # S3 bucket for server access log
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: Retain
+            Status: Enabled
+            ExpirationInDays: !Ref RetainDays
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  # S3 bucket policy for server access log
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: 
+              - !Sub ${AccessLogBucket.Arn}/*
+              - !GetAtt AccessLogBucket.Arn
+            Condition:
+              Bool: 
+                aws:SecureTransport: false
+          - Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource:
+              - !Sub ${AccessLogBucket.Arn}/${AccessLogPrefix}*
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt AuditLogBucket.Arn
+              StringEquals: 
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # IAM policy for audit log streaming role
+  AuditLogStremingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for GitHub Audit Log Streaming
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub ${AuditLogBucket.Arn}/*
+
+  # IAM role for audit log streaming role
+  AuditLogStreamingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns: 
+        - !Ref AuditLogStremingPolicy
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Ref GithubAuditLogOIDCProvider
+            Condition:
+              StringEquals:
+                oidc-configuration.audit-log.githubusercontent.com:sub: !Sub https://github.com/${EnterpriseName}
+                oidc-configuration.audit-log.githubusercontent.com:aud: sts.amazonaws.com
+
+  GithubAuditLogOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://oidc-configuration.audit-log.githubusercontent.com
+      ClientIdList: 
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 7e6db7b7584d8cf2003e0931e6cfc41a3a62d3df
+
+Outputs:
+  IAMRole:
+    Description: IAM role for audit log streaming role
+    Value: !GetAtt AuditLogStreamingRole.Arn
+  AuditLogBucket:
+    Description: S3 bucket for audit log
+    Value: !Ref AuditLogBucket
